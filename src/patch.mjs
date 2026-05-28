@@ -392,18 +392,20 @@ const patches = [
   },
 
   // ── 解锁第三方 API 的 Auto-Memory ──
-  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的关键门禁函数：
+  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的"阻挡"函数：
   //   1. Z$("tengu_sepia_cormorant",null) → 如果 null（默认），返回 false
   //   2. 否则 iTK(modelName, allowlist) → 检查当前模型名是否在白名单中
   //   3. Z$("tengu_umber_petrel",!1) → 最终开关，默认 false
-  // 第三方模型名不在 Anthropic 白名单 → ui$() 返回 false → x9() 关闭 auto-memory。
-  // 补丁：让 ui$() 直接返回 true，auto-memory 对所有模型启用。
+  // 在调用方 x9()/C9() 中：if(ui$())return!1 → truthy → 禁用 auto-memory。
+  // 因此 ui$() 是"阻挡检查"函数：返回 true = 阻挡（禁用），返回 false = 放行（启用）。
+  // 第三方模型名不在白名单 → ui$() 返回 true → x9() 里的 if(ui$())return!1 生效 → 关闭。
+  // 补丁：让 ui$() 直接返回 false（放行），auto-memory 对所有模型启用。
   // 注意：minifier 混淆名可能跨版本变化（v2.1.142: Pi$, v2.1.143: ui$），
   //   所以 pattern 使用 [\\w$]+ 通配符匹配函数名。
   {
     name: 'Enable auto-memory for third-party API (bypass model allowlist gate)',
     pattern: /function ([\w$]+)\(\)\{let H=[\w$]+\("tengu_sepia_cormorant",null\);if\(!Array\.isArray\(H\)\|\|H\.length===0\)return!1;let \$=[\w$]+\(\),q=\$!==void 0\?\$:[\w$]+\(\);if\(typeof q!=="string"\|\|![\w$]+\(q,H\)\)return!1;return [\w$]+\("tengu_umber_petrel",!1\)\}/g,
-    replacer: (m, fn) => `function ${fn}(){return!0}`,
+    replacer: (m, fn) => `function ${fn}(){return!1}`,
     sentinel: 'tengu_sepia_cormorant",null);if(!Array.isArray(H)',
   },
 
@@ -612,6 +614,18 @@ const patches = [
       const nearby = code.substring(pos, pos + 500);
       return nearby.includes('claude-sonnet-4-5');
     },
+  },
+  {
+    // k9() is the system prompt identity function.
+    // Original: function k9(H){return H}
+    // Patched:  function k9(H){let _=process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(_)H.push(_);return H}
+    // Appends CLAUDE.md (injected via cli.cjs) into the system prompt array
+    // so third-party API models see CLAUDE.md as authoritative system instruction,
+    // not as auxiliary userContext.
+    name: 'Append CLAUDE_CODE_APPEND_SYSTEM_PROMPT into system prompt',
+    pattern: /function k9\(H\)\{return H\}/g,
+    replacer: () => 'function k9(H){let _=process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(_)H.push(_);return H}',
+    sentinel: 'function k9(H){return H}',
   },
 ];
 

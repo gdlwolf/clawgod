@@ -6,19 +6,45 @@ const { spawnSync } = require('child_process');
 
 const clawgodDir = join(homedir(), '.clawgod');
 
-// Note: there used to be a "drift detection" block here that scanned
-// ~/.local/share/claude/versions/ for a newer binary and silently re-patched.
-// Removed because:
-//   1. Windows users don't have a `versions/` directory at all (Anthropic's
-//      Windows install doesn't follow that convention).
-//   2. We patch out `claude update` (it would otherwise overwrite the bun
-//      runtime under our launcher), so `versions/` no longer auto-grows
-//      on a healthy clawgod install.
-// In practice the block was reading a directory that never changes, but
-// could *retract* a fresher version that install.sh just pulled from npm
-// registry — putting users into a re-patch loop. Upgrades now go through
-// the patched `claude update` → install.sh redirect, which always pulls
-// the latest from npm.
+// ─── Drift detection ───────────────────────────────────────
+// On Linux/macOS, the native Claude binary lives in
+// ~/.local/share/claude/versions/<version>.  If the user upgraded
+// Claude Code through the official installer (or auto-update), a
+// newer binary may exist there while our .source-version is stale.
+// Re-extract + re-patch transparently on next launch.
+const versionsDir = join(homedir(), '.local', 'share', 'claude', 'versions');
+const sourceVerFile = join(clawgodDir, '.source-version');
+if (process.platform !== 'win32' && existsSync(versionsDir)) {
+  try {
+    const entries = readdirSync(versionsDir, { withFileTypes: true });
+    const vers = entries
+      .filter(e => e.isFile() || e.isDirectory())
+      .map(e => e.name)
+      .filter(n => /^[\d.]+$/.test(n))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    if (vers.length > 0) {
+      const latest = vers[0];
+      const stamped = existsSync(sourceVerFile)
+        ? readFileSync(sourceVerFile, 'utf8').trim()
+        : '';
+      if (stamped !== latest) {
+        const binPath = join(versionsDir, latest);
+        const repatch = join(clawgodDir, 'repatch.mjs');
+        if (existsSync(repatch) && existsSync(binPath)) {
+          const r = spawnSync(process.execPath, [repatch, binPath], {
+            cwd: clawgodDir,
+            stdio: 'inherit',
+          });
+          if (r.status !== 0) {
+            console.error(`[clawgod] drift: re-patch to ${latest} failed (exit ${r.status})`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Non-fatal: if we can't detect drift, proceed with current patch
+  }
+}
 
 // One-time migration: earlier wrapper versions set CLAUDE_CONFIG_DIR=~/.clawgod,
 // which made Claude Code read/write ~/.clawgod/.claude.json instead of the
@@ -75,6 +101,10 @@ process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
 // rg is the most reliable fallback under Bun runtime).
 process.env.USE_BUILTIN_RIPGREP ??= '1';
 
+// 强制使用系统 bash 而非 Bun shell 执行 shell 命令，避免 Bun 的 shell
+// 解析器在处理 pipeline + 复杂参数时出现的 Invalid Argument 错误。
+process.env.SHELL = '/bin/bash';
+
 // ─── 第三方 API 智能优化 ─────────────────────────────────
 // 当检测到使用非 api.anthropic.com 的 baseURL 时，自动应用
 // 第三方 API 兼容配置，避免 400 错误同时保持功能完整。
@@ -93,6 +123,29 @@ if (isThirdParty) {
 
   // 4. 流看门狗超时（慢响应不误判为断连）
   process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS ??= '120000';
+
+  // 5. 将 CLAUDE.md 注入 system prompt 的 `system` 参数
+  //    第三方 API 的 system prompt 中不包含 CLAUDE.md 内容（它是作为 userContext
+  //    传递的），导致模型不遵守 CLAUDE.md 的指令。通过 CLAUDE_CODE_APPEND_SYSTEM_PROMPT
+  //    将其追加到 system prompt 末尾，每次 API 请求都携带。
+  const claudeMdDirs = [
+    join(process.cwd(), 'CLAUDE.md'),
+    join(process.cwd(), '.claude', 'CLAUDE.md'),
+    join(homedir(), 'CLAUDE.md'),
+  ];
+  let claudeMdContent = '';
+  for (const p of claudeMdDirs) {
+    if (existsSync(p)) {
+      try {
+        const md = readFileSync(p, 'utf8').trim();
+        if (md) claudeMdContent += (claudeMdContent ? '\n\n---\n\n' : '') + md;
+      } catch {}
+    }
+  }
+  if (claudeMdContent) {
+    process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT ??=
+      `\n\n<user_claude_md>\n${claudeMdContent}\n</user_claude_md>`;
+  }
 }
 
 const featuresFile = join(providerDir, 'features.json');

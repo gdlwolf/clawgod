@@ -818,19 +818,45 @@ const { spawnSync } = require('child_process');
 
 const clawgodDir = join(homedir(), '.clawgod');
 
-// Note: there used to be a "drift detection" block here that scanned
-// ~/.local/share/claude/versions/ for a newer binary and silently re-patched.
-// Removed because:
-//   1. Windows users don't have a `versions/` directory at all (Anthropic's
-//      Windows install doesn't follow that convention).
-//   2. We patch out `claude update` (it would otherwise overwrite the bun
-//      runtime under our launcher), so `versions/` no longer auto-grows
-//      on a healthy clawgod install.
-// In practice the block was reading a directory that never changes, but
-// could *retract* a fresher version that install.sh just pulled from npm
-// registry — putting users into a re-patch loop. Upgrades now go through
-// the patched `claude update` → install.sh redirect, which always pulls
-// the latest from npm.
+// ─── Drift detection ───────────────────────────────────────
+// On Linux/macOS, the native Claude binary lives in
+// ~/.local/share/claude/versions/<version>.  If the user upgraded
+// Claude Code through the official installer (or auto-update), a
+// newer binary may exist there while our .source-version is stale.
+// Re-extract + re-patch transparently on next launch.
+const versionsDir = join(homedir(), '.local', 'share', 'claude', 'versions');
+const sourceVerFile = join(clawgodDir, '.source-version');
+if (process.platform !== 'win32' && existsSync(versionsDir)) {
+  try {
+    const entries = readdirSync(versionsDir, { withFileTypes: true });
+    const vers = entries
+      .filter(e => e.isFile() || e.isDirectory())
+      .map(e => e.name)
+      .filter(n => /^[\d.]+$/.test(n))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    if (vers.length > 0) {
+      const latest = vers[0];
+      const stamped = existsSync(sourceVerFile)
+        ? readFileSync(sourceVerFile, 'utf8').trim()
+        : '';
+      if (stamped !== latest) {
+        const binPath = join(versionsDir, latest);
+        const repatch = join(clawgodDir, 'repatch.mjs');
+        if (existsSync(repatch) && existsSync(binPath)) {
+          const r = spawnSync(process.execPath, [repatch, binPath], {
+            cwd: clawgodDir,
+            stdio: 'inherit',
+          });
+          if (r.status !== 0) {
+            console.error(`[clawgod] drift: re-patch to ${latest} failed (exit ${r.status})`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Non-fatal: if we can't detect drift, proceed with current patch
+  }
+}
 
 // One-time migration: earlier wrapper versions set CLAUDE_CONFIG_DIR=~/.clawgod,
 // which made Claude Code read/write ~/.clawgod/.claude.json instead of the
@@ -887,6 +913,10 @@ process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
 // rg is the most reliable fallback under Bun runtime).
 process.env.USE_BUILTIN_RIPGREP ??= '1';
 
+// 强制使用系统 bash 而非 Bun shell 执行 shell 命令，避免 Bun 的 shell
+// 解析器在处理 pipeline + 复杂参数时出现的 Invalid Argument 错误。
+process.env.SHELL = '/bin/bash';
+
 // ─── 第三方 API 智能优化 ─────────────────────────────────
 // 当检测到使用非 api.anthropic.com 的 baseURL 时，自动应用
 // 第三方 API 兼容配置，避免 400 错误同时保持功能完整。
@@ -905,6 +935,29 @@ if (isThirdParty) {
 
   // 4. 流看门狗超时（慢响应不误判为断连）
   process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS ??= '120000';
+
+  // 5. 将 CLAUDE.md 注入 system prompt 的 `system` 参数
+  //    第三方 API 的 system prompt 中不包含 CLAUDE.md 内容（它是作为 userContext
+  //    传递的），导致模型不遵守 CLAUDE.md 的指令。通过 CLAUDE_CODE_APPEND_SYSTEM_PROMPT
+  //    将其追加到 system prompt 末尾，每次 API 请求都携带。
+  const claudeMdDirs = [
+    join(process.cwd(), 'CLAUDE.md'),
+    join(process.cwd(), '.claude', 'CLAUDE.md'),
+    join(homedir(), 'CLAUDE.md'),
+  ];
+  let claudeMdContent = '';
+  for (const p of claudeMdDirs) {
+    if (existsSync(p)) {
+      try {
+        const md = readFileSync(p, 'utf8').trim();
+        if (md) claudeMdContent += (claudeMdContent ? '\n\n---\n\n' : '') + md;
+      } catch {}
+    }
+  }
+  if (claudeMdContent) {
+    process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT ??=
+      `\n\n<user_claude_md>\n${claudeMdContent}\n</user_claude_md>`;
+  }
 }
 
 const featuresFile = join(providerDir, 'features.json');
@@ -1319,18 +1372,20 @@ const patches = [
   },
 
   // ── 解锁第三方 API 的 Auto-Memory ──
-  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的关键门禁函数：
+  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的"阻挡"函数：
   //   1. Z$("tengu_sepia_cormorant",null) → 如果 null（默认），返回 false
   //   2. 否则 iTK(modelName, allowlist) → 检查当前模型名是否在白名单中
   //   3. Z$("tengu_umber_petrel",!1) → 最终开关，默认 false
-  // 第三方模型名不在 Anthropic 白名单 → ui$() 返回 false → x9() 关闭 auto-memory。
-  // 补丁：让 ui$() 直接返回 true，auto-memory 对所有模型启用。
+  // 在调用方 x9()/C9() 中：if(ui$())return!1 → truthy → 禁用 auto-memory。
+  // 因此 ui$() 是"阻挡检查"函数：返回 true = 阻挡（禁用），返回 false = 放行（启用）。
+  // 第三方模型名不在白名单 → ui$() 返回 true → x9() 里的 if(ui$())return!1 生效 → 关闭。
+  // 补丁：让 ui$() 直接返回 false（放行），auto-memory 对所有模型启用。
   // 注意：minifier 混淆名可能跨版本变化（v2.1.142: Pi$, v2.1.143: ui$），
   //   所以 pattern 使用 [\\w$]+ 通配符匹配函数名。
   {
     name: 'Enable auto-memory for third-party API (bypass model allowlist gate)',
     pattern: /function ([\w$]+)\(\)\{let H=[\w$]+\("tengu_sepia_cormorant",null\);if\(!Array\.isArray\(H\)\|\|H\.length===0\)return!1;let \$=[\w$]+\(\),q=\$!==void 0\?\$:[\w$]+\(\);if\(typeof q!=="string"\|\|![\w$]+\(q,H\)\)return!1;return [\w$]+\("tengu_umber_petrel",!1\)\}/g,
-    replacer: (m, fn) => `function ${fn}(){return!0}`,
+    replacer: (m, fn) => `function ${fn}(){return!1}`,
     sentinel: 'tengu_sepia_cormorant",null);if(!Array.isArray(H)',
   },
 
@@ -1539,6 +1594,18 @@ const patches = [
       const nearby = code.substring(pos, pos + 500);
       return nearby.includes('claude-sonnet-4-5');
     },
+  },
+  {
+    // k9() is the system prompt identity function.
+    // Original: function k9(H){return H}
+    // Patched:  function k9(H){let _=process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(_)H.push(_);return H}
+    // Appends CLAUDE.md (injected via cli.cjs) into the system prompt array
+    // so third-party API models see CLAUDE.md as authoritative system instruction,
+    // not as auxiliary userContext.
+    name: 'Append CLAUDE_CODE_APPEND_SYSTEM_PROMPT into system prompt',
+    pattern: /function k9\(H\)\{return H\}/g,
+    replacer: () => 'function k9(H){let _=process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(_)H.push(_);return H}',
+    sentinel: 'function k9(H){return H}',
   },
 ];
 
