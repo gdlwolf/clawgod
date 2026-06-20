@@ -157,4 +157,41 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
+// ─── CLAUDE_CODE_EXECPATH → native binary ─────────────────
+// Claude Code's built-in Bash `grep`/`find` shell functions do
+// `exec -a ugrep "$CLAUDE_CODE_EXECPATH" -G ...` (they reuse the claude
+// binary as a bundled ugrep/bfs). The default fallback for that env is
+// `$(command -v claude)`, which under clawgod points at THIS bun launcher
+// (no ugrep capability) → every `grep` call dies with bun's
+// "error: Invalid Argument '-G'". Point it at the real native Claude binary
+// instead. Best-effort: if we can't resolve it, leave the env unset so the
+// default fallback still applies (no worse than before).
+if (!process.env.CLAUDE_CODE_EXECPATH) {
+  try {
+    let nativeBin = '';
+    if (process.platform === 'win32') {
+      for (const cand of [
+        join(homedir(), '.bun', 'bin', 'claude.exe'),
+        join(homedir(), '.local', 'bin', 'claude.orig.exe'),
+      ]) {
+        if (existsSync(cand)) { nativeBin = cand; break; }
+      }
+    } else {
+      const vDir = join(homedir(), '.local', 'share', 'claude', 'versions');
+      if (existsSync(vDir)) {
+        const latest = readdirSync(vDir, { withFileTypes: true })
+          .filter(e => e.isFile() || e.isDirectory())
+          .map(e => e.name)
+          .filter(n => /^[\d.]+$/.test(n))
+          .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+        if (latest) {
+          const p = join(vDir, latest);
+          if (existsSync(p)) nativeBin = p;
+        }
+      }
+    }
+    if (nativeBin) process.env.CLAUDE_CODE_EXECPATH = nativeBin;
+  } catch {}
+}
+
 require('./cli.original.cjs');
