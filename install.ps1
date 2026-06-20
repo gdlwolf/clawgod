@@ -852,11 +852,45 @@ const { spawnSync } = require('child_process');
 
 const clawgodDir = join(homedir(), '.clawgod');
 
-// Note: drift detection removed — see install.sh wrapper for full notes.
-// `versions/` either doesn't exist (Windows) or doesn't grow on healthy
-// clawgod installs (we patch out `claude update`), so the check could only
-// retract a fresh install.ps1 / install.sh upgrade. `claude update` →
-// install.sh redirect is the single source of truth for version upgrades.
+// ─── Drift detection ───────────────────────────────────────
+// On Linux/macOS, the native Claude binary lives in
+// ~/.local/share/claude/versions/<version>.  If the user upgraded
+// Claude Code through the official installer (or auto-update), a
+// newer binary may exist there while our .source-version is stale.
+// Re-extract + re-patch transparently on next launch.
+const versionsDir = join(homedir(), '.local', 'share', 'claude', 'versions');
+const sourceVerFile = join(clawgodDir, '.source-version');
+if (process.platform !== 'win32' && existsSync(versionsDir)) {
+  try {
+    const entries = readdirSync(versionsDir, { withFileTypes: true });
+    const vers = entries
+      .filter(e => e.isFile() || e.isDirectory())
+      .map(e => e.name)
+      .filter(n => /^[\d.]+$/.test(n))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    if (vers.length > 0) {
+      const latest = vers[0];
+      const stamped = existsSync(sourceVerFile)
+        ? readFileSync(sourceVerFile, 'utf8').trim()
+        : '';
+      if (stamped !== latest) {
+        const binPath = join(versionsDir, latest);
+        const repatch = join(clawgodDir, 'repatch.mjs');
+        if (existsSync(repatch) && existsSync(binPath)) {
+          const r = spawnSync(process.execPath, [repatch, binPath], {
+            cwd: clawgodDir,
+            stdio: 'inherit',
+          });
+          if (r.status !== 0) {
+            console.error(`[clawgod] drift: re-patch to ${latest} failed (exit ${r.status})`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Non-fatal: if we can't detect drift, proceed with current patch
+  }
+}
 
 // One-time migration: earlier wrapper versions set CLAUDE_CONFIG_DIR=~/.clawgod,
 // which made Claude Code read/write ~/.clawgod/.claude.json instead of the
@@ -876,7 +910,7 @@ const defaultConfig = {
   baseURL: 'https://api.anthropic.com',
   model: '',
   smallModel: '',
-  timeoutMs: 3000000,
+  timeoutMs: 60000,
 };
 
 let config = { ...defaultConfig };
@@ -909,7 +943,56 @@ if (config.timeoutMs) {
 }
 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
 process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
+// Use system ripgrep (extracted vendor rg path was build-time-baked; system
+// rg is the most reliable fallback under Bun runtime).
 process.env.USE_BUILTIN_RIPGREP ??= '1';
+
+// 强制使用系统 bash 而非 Bun shell 执行 shell 命令，避免 Bun 的 shell
+// 解析器在处理 pipeline + 复杂参数时出现的 Invalid Argument 错误。
+process.env.SHELL = '/bin/bash';
+
+// ─── 第三方 API 智能优化 ─────────────────────────────────
+// 当检测到使用非 api.anthropic.com 的 baseURL 时，自动应用
+// 第三方 API 兼容配置，避免 400 错误同时保持功能完整。
+const isThirdParty = config.baseURL && !/anthropic\.com/i.test(config.baseURL);
+
+if (isThirdParty) {
+  // 1. 禁用 beta headers — 避免第三方 API 不认识的 beta 导致 400
+  //    (NI6() 补丁已确保 Tool Search 不受此影响)
+  process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS ??= '1';
+
+  // 2. 确保 Tool Search 启用（覆盖 DISABLE_EXPERIMENTAL_BETAS 的影响）
+  process.env.ENABLE_TOOL_SEARCH ??= 'auto:0';
+
+  // 3. 合理的超时（第三方 API 通常比官方慢）
+  process.env.API_TIMEOUT_MS ??= String(config.timeoutMs || 120000);
+
+  // 4. 流看门狗超时（慢响应不误判为断连）
+  process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS ??= '120000';
+
+  // 5. 将 CLAUDE.md 注入 system prompt 的 `system` 参数
+  //    第三方 API 的 system prompt 中不包含 CLAUDE.md 内容（它是作为 userContext
+  //    传递的），导致模型不遵守 CLAUDE.md 的指令。通过 CLAUDE_CODE_APPEND_SYSTEM_PROMPT
+  //    将其追加到 system prompt 末尾，每次 API 请求都携带。
+  const claudeMdDirs = [
+    join(process.cwd(), 'CLAUDE.md'),
+    join(process.cwd(), '.claude', 'CLAUDE.md'),
+    join(homedir(), 'CLAUDE.md'),
+  ];
+  let claudeMdContent = '';
+  for (const p of claudeMdDirs) {
+    if (existsSync(p)) {
+      try {
+        const md = readFileSync(p, 'utf8').trim();
+        if (md) claudeMdContent += (claudeMdContent ? '\n\n---\n\n' : '') + md;
+      } catch {}
+    }
+  }
+  if (claudeMdContent) {
+    process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT ??=
+      `\n\n<user_claude_md>\n${claudeMdContent}\n</user_claude_md>`;
+  }
+}
 
 const featuresFile = join(providerDir, 'features.json');
 if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
@@ -920,7 +1003,45 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
+// ─── CLAUDE_CODE_EXECPATH → native binary ─────────────────
+// Claude Code's built-in Bash `grep`/`find` shell functions do
+// `exec -a ugrep "$CLAUDE_CODE_EXECPATH" -G ...` (they reuse the claude
+// binary as a bundled ugrep/bfs). The default fallback for that env is
+// `$(command -v claude)`, which under clawgod points at THIS bun launcher
+// (no ugrep capability) → every `grep` call dies with bun's
+// "error: Invalid Argument '-G'". Point it at the real native Claude binary
+// instead. Best-effort: if we can't resolve it, leave the env unset so the
+// default fallback still applies (no worse than before).
+if (!process.env.CLAUDE_CODE_EXECPATH) {
+  try {
+    let nativeBin = '';
+    if (process.platform === 'win32') {
+      for (const cand of [
+        join(homedir(), '.bun', 'bin', 'claude.exe'),
+        join(homedir(), '.local', 'bin', 'claude.orig.exe'),
+      ]) {
+        if (existsSync(cand)) { nativeBin = cand; break; }
+      }
+    } else {
+      const vDir = join(homedir(), '.local', 'share', 'claude', 'versions');
+      if (existsSync(vDir)) {
+        const latest = readdirSync(vDir, { withFileTypes: true })
+          .filter(e => e.isFile() || e.isDirectory())
+          .map(e => e.name)
+          .filter(n => /^[\d.]+$/.test(n))
+          .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+        if (latest) {
+          const p = join(vDir, latest);
+          if (existsSync(p)) nativeBin = p;
+        }
+      }
+    }
+    if (nativeBin) process.env.CLAUDE_CODE_EXECPATH = nativeBin;
+  } catch {}
+}
+
 require('./cli.original.cjs');
+
 '@
 [System.IO.File]::WriteAllText((Join-Path $ClawDir "cli.cjs"), $wrapperCode, [System.Text.UTF8Encoding]::new($false))
 Write-OK "Wrapper created (cli.cjs)"
@@ -1030,16 +1151,15 @@ const patches = [
     optional: true,  // removed in v2.1.143+
   },
   {
-    // ≤v2.1.110: let Y=Dq();if(Y!=="firstParty"&&Y!=="anthropicAws")return!1;return/^claude-(opus|sonnet)-4-6/.test(K)
-    // v2.1.119+: same gate plus extra branches for claude-opus-4-7.
-    // v2.1.139+: gate moved inside function wuH(H){let $=R7(H),q=Wq();if(q!=="firstParty"&&q!=="anthropicAws")return!1;if($.includes("claude-3-")||...)return!0;return!1}
-    //            i.e. the `let` lifted to a comma-list before the if; the if-gate
-    //            itself is unchanged shape. We drop only the if-gate; downstream
-    //            model allow-list still runs and now accepts third-party calls.
-    name: 'Auto-mode unlock for third-party API',
-    pattern: /if\(([\w$]+)!=="firstParty"&&\1!=="anthropicAws"\)return!1;/g,
-    replacer: () => '',
-    sentinel: '!=="firstParty"&&',
+    // v2.1.143-:   auto-mode gate was `if($VAR!=="firstParty"&&$VAR!=="anthropicAws")return!1;`
+    // v2.1.160+:   gate moved to a dedicated function:
+    //                function aM$(H){if(H==="firstParty"||H==="anthropicAws")return!0;return FH(process.env.CLAUDE_CODE_ENABLE_AUTO_MODE)}
+    //              Auto-mode disable in Yv$(): `!aM$(Jq())`
+    //              Forcing aM$() to always return true removes the provider gate.
+    name: 'Auto-mode unlock for third-party API (bypass provider gate)',
+    pattern: /function ([\w$]+)\(([\w$]+)\)\{if\(\2==="firstParty"\|\|\2==="anthropicAws"\)return!0;return [\w$]+\(process\.env\.CLAUDE_CODE_ENABLE_AUTO_MODE\)\}/g,
+    replacer: (m, fn, arg) => `function ${fn}(${arg}){/*cg-automode*/return!0}`,
+    patchedMarker: '/*cg-automode*/return!0',
   },
   {
     // CLI subcommand registered via commander chain:
@@ -1086,6 +1206,7 @@ const patches = [
       );
     },
     sentinel: '.command("update").alias("upgrade")',
+    patchedMarker: "[clawgod] 'claude update' is handled",
   },
   // ── 模型默认值重定向 ──
   // Sub-agent 默认使用 MJ$() → MY().opus47（硬编码 claude-opus-4-7）
@@ -1117,10 +1238,22 @@ const patches = [
   // Older v2.1.142 shape: function X(){return Y()&&!CH(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)}
   // — matched by the old regex. v2.1.143 removed the DISABLE_EXPERIMENTAL_BETAS check.
   {
-    name: 'Bypass ST() firstParty gate (enable features for 3rd party)',
-    pattern: /function ST\(\)\{return [\w$]+\(\)\}/g,
-    replacer: () => 'function ST(){return!0}',
+    name: 'Bypass ST()/$M() firstParty gate (enable features for 3rd party)',
+    // 2.1.143: function ST(){return w86()} ; 2.1.183: function $M(){return SRr()&&!jNe()}
+    // — wildcard the fn name and both callees (was hardcoded ST + single callee).
+    pattern: /function ([\w$]+)\(\)\{return [\w$]+\(\)&&![\w$]+\(\)\}/g,
+    replacer: (m, fn) => `function ${fn}(){/*cg-st-bypass*/return!0}`,
+    patchedMarker: '/*cg-st-bypass*/return!0',
     sentinel: 'function ST(){return w86()}',
+    validate: (match, code) => {
+      // $M is the firstParty master switch; it is immediately followed by
+      // the cache-scope function that gates on it (if(!$M())return!1).
+      const name = /function ([\w$]+)\(\)\{/.exec(match)?.[1];
+      if (!name) return false;
+      const idx = code.indexOf(match);
+      const after = code.substring(idx + match.length, idx + match.length + 120);
+      return after.includes(`if(!${name}())`);
+    },
   },
   // ── cI6()/dI6() Tool Search mode — remove DISABLE_EXPERIMENTAL_BETAS gate ──
   // v2.1.142: function cI6(){if(CH(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS))return"standard";let H=...}
@@ -1157,9 +1290,9 @@ const patches = [
     // Minified header-merge function name (Lq→Jq→etc) changes per build.
     // Match any valid JS identifier via capture group.
     name: 'Strip all beta headers in messages API when DISABLE_EXPERIMENTAL_BETAS=1',
-    pattern: /parse\(H,\$\)\{return \$=\{\.\.\.\$,headers:([\w$]+)\(\[\{"anthropic-beta":\[\.\.\.H\.betas\?\?\[\],"structured-outputs-2025-12-15"\]\.toString\(\)\},\$\?\.headers\]\)\},this\.create\(H,\$\)\.then\(/g,
-    replacer: (m, fn) => `parse(H,$){let _betas=process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS?[]:[...H.betas??[],"structured-outputs-2025-12-15"];return $={...$,headers:${fn}([{"anthropic-beta":_betas.toString()},$?.headers])},this.create(H,$).then(`,
-    sentinel: 'structured-outputs-2025-12-15"].toString()},$?.headers])},this.create(H,$).then(',
+    pattern: /parse\(([\w$]+),([\w$]+)\)\{return \2=\{\.\.\.\2,headers:([\w$]+)\(\[\{"anthropic-beta":\[\.\.\.\1\.betas\?\?\[\],"structured-outputs-2025-12-15"\]\.toString\(\)\},\2\?\.headers\]\)\},this\.create\(\1,\2\)\.then\(/g,
+    replacer: (m, h, dollar, fn) => `parse(${h},${dollar}){let _betas=process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS?[]:[...${h}.betas??[],"structured-outputs-2025-12-15"];return ${dollar}={...${dollar},headers:${fn}([{"anthropic-beta":_betas.toString()},${dollar}?.headers])},this.create(${h},${dollar}).then(`,
+    patchedMarker: 'let _betas=process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS?[]:',
   },
 
   // ── web_search 对第三方 API 禁用 → 改用 web_fetch ──
@@ -1319,25 +1452,28 @@ const patches = [
   // JSON 返回格式说明，模型仍会返回可解析的 JSON。
   {
     name: 'Disable outputFormat json_schema for third-party API',
-    pattern: /function ([\w$]+)\(H\)\{let \$=[\w$]+\(H\),q=[\w$]+\(H\);if\(![\w$]+\(q\)\|\|q==="gateway"\)return!1;if\(\$\.includes\("claude-3-"\)\|\|\$==="claude-opus-4-0"\|\|\$==="claude-sonnet-4-0"\)return!1;return!0\}/g,
-    replacer: (m, fn) => m.replace(`function ${fn}(H){`, `function ${fn}(H){if(process.env.ANTHROPIC_BASE_URL&&!/anthropic\\.com/i.test(process.env.ANTHROPIC_BASE_URL))return!1;`),
-    sentinel: 'ANTHROPIC_BASE_URL&&!/anthropic\\.com/i.test(process.env.ANTHROPIC_BASE_URL))return!1;let $',
-    sentinelAbsence: true,  // sentinel presence = already patched
+    // v2.1.175: function uEH(H){let $=KK(H),q=$w(H);if(!Eh(q))return!1;if($.includes("claude-3-")||$==="claude-opus-4-0"||$==="claude-sonnet-4-0")return!1;return!0}
+    // v2.1.143: function X(H){let $=Y(H),q=Z(H);if(!W(q)||q==="gateway")return!1;...}
+    pattern: /function ([\w$]+)\(([\w$]+)\)\{let [\w$]+=[\w$]+\([\w$]+\),[\w$]+=[\w$]+\([\w$]+\);if\(![\w$]+\([\w$]+\)(?:\|\|[\w$]+==="gateway")?\)return!1;if\([\w$]+\.includes\("claude-3-"\)\|\|[\w$]+==="claude-opus-4-0"\|\|[\w$]+==="claude-sonnet-4-0"\)return!1;return!0\}/g,
+    replacer: (m, fn, arg) => m.replace(`function ${fn}(${arg}){`, `function ${fn}(${arg}){/*cg-outfmt*/if(process.env.ANTHROPIC_BASE_URL&&!/anthropic\\.com/i.test(process.env.ANTHROPIC_BASE_URL))return!1;`),
+    patchedMarker: '/*cg-outfmt*/if(process.env.ANTHROPIC_BASE_URL',
   },
 
   // ── 解锁第三方 API 的 Auto-Memory ──
-  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的关键门禁函数：
+  // ui$() (v2.1.143, was Pi$()) 是 auto-memory 系统的"阻挡"函数：
   //   1. Z$("tengu_sepia_cormorant",null) → 如果 null（默认），返回 false
   //   2. 否则 iTK(modelName, allowlist) → 检查当前模型名是否在白名单中
   //   3. Z$("tengu_umber_petrel",!1) → 最终开关，默认 false
-  // 第三方模型名不在 Anthropic 白名单 → ui$() 返回 false → x9() 关闭 auto-memory。
-  // 补丁：让 ui$() 直接返回 true，auto-memory 对所有模型启用。
+  // 在调用方 x9()/C9() 中：if(ui$())return!1 → truthy → 禁用 auto-memory。
+  // 因此 ui$() 是"阻挡检查"函数：返回 true = 阻挡（禁用），返回 false = 放行（启用）。
+  // 第三方模型名不在白名单 → ui$() 返回 true → x9() 里的 if(ui$())return!1 生效 → 关闭。
+  // 补丁：让 ui$() 直接返回 false（放行），auto-memory 对所有模型启用。
   // 注意：minifier 混淆名可能跨版本变化（v2.1.142: Pi$, v2.1.143: ui$），
   //   所以 pattern 使用 [\\w$]+ 通配符匹配函数名。
   {
     name: 'Enable auto-memory for third-party API (bypass model allowlist gate)',
     pattern: /function ([\w$]+)\(\)\{let H=[\w$]+\("tengu_sepia_cormorant",null\);if\(!Array\.isArray\(H\)\|\|H\.length===0\)return!1;let \$=[\w$]+\(\),q=\$!==void 0\?\$:[\w$]+\(\);if\(typeof q!=="string"\|\|![\w$]+\(q,H\)\)return!1;return [\w$]+\("tengu_umber_petrel",!1\)\}/g,
-    replacer: (m, fn) => `function ${fn}(){return!0}`,
+    replacer: (m, fn) => `function ${fn}(){return!1}`,
     sentinel: 'tengu_sepia_cormorant",null);if(!Array.isArray(H)',
   },
 
@@ -1374,9 +1510,9 @@ const patches = [
   //   移除 vq()!=="firstParty" 检查，同时保留 DISABLE_ADVISOR_TOOL 和 GrowthBook 控制。
   {
     name: 'Enable Advisor tool for third-party API',
-    pattern: /if\(bH\(process\.env\.CLAUDE_CODE_DISABLE_ADVISOR_TOOL\)\)return!1;if\(vq\(\)!=="firstParty"\|\|!([\w$]+)\(\)\)return!1;/g,
-    replacer: (m, fn) => 'if(bH(process.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL))return!1;',
-    sentinel: 'DISABLE_ADVISOR_TOOL))return!1;if(vq()!=="firstParty"',
+    pattern: /if\(([\w$]+)\(process\.env\.CLAUDE_CODE_DISABLE_ADVISOR_TOOL\)\)return!1;if\(([\w$]+)\(\)!=="firstParty"\|\|!([\w$]+)\(\)\)return!1;/g,
+    replacer: (m, envfn) => `if(${envfn}(process.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL))return!1;/*cg-advisor*/`,
+    patchedMarker: '/*cg-advisor*/',
   },
 
   // ── Image Size Limit 提升 — 第三方 API 限制 5MB → 10MB ──
@@ -1387,9 +1523,9 @@ const patches = [
   //   让第三方 API 用户也享受 10MB 限制。
   {
     name: 'Unlock 10MB image size limit for third-party API',
-    pattern: /function ([\w$]+)\(\)\{if\(vq\(\)==="firstParty"&&([\w$]+)\(\)&&Z\$\("tengu_crimson_vector",!1\)\)return ([\w$]+);return ([\w$]+)\.maxBase64Size\}/g,
-    replacer: (m, fn, pYfn, sxk, ql) => `function ${fn}(){if(${pYfn}()&&Z$("tengu_crimson_vector",!1))return ${sxk};return ${ql}.maxBase64Size}`,
-    sentinel: 'vq()==="firstParty"&&',
+    pattern: /function ([\w$]+)\(\)\{if\(([\w$]+)\(\)==="firstParty"&&([\w$]+)\(\)&&([\w$]+)\("tengu_crimson_vector",!1\)\)return ([\w$]+);return ([\w$]+)\.maxBase64Size\}/g,
+    replacer: (m, fn, provfn, pYfn, flagfn, sxk, ql) => `function ${fn}(){/*cg-img10m*/if(${pYfn}()&&${flagfn}("tengu_crimson_vector",!1))return ${sxk};return ${ql}.maxBase64Size}`,
+    patchedMarker: '/*cg-img10m*/if(',
   },
 
   // ── Send User File 工具解锁 — 第三方 API 用户无法发送文件给模型 ──
@@ -1397,10 +1533,9 @@ const patches = [
   //   移除 vq()!=="firstParty" 检查。
   {
     name: 'Enable Send User File tool for third-party API',
-    pattern: /isEnabled\(\)\{if\(vq\(\)!=="firstParty"\|\|([\w$]+)\(\)\)return!1;if\(!Z\$\("tengu_send_user_file",!0\)\)return!1;/g,
-    replacer: (m, fn) => 'isEnabled(){if(!Z$("tengu_send_user_file",!0))return!1;',
-    sentinel: 'vq()!=="firstParty"||',
-    validate: (match, code) => code.indexOf('tengu_send_user_file') !== -1,
+    pattern: /isEnabled\(\)\{if\(([\w$]+)\(\)!=="firstParty"\|\|[\w$]+\(\)\)return!1;if\(!([\w$]+)\("tengu_send_user_file",!0\)\)return!1;/g,
+    replacer: (m, provfn, flagfn) => `isEnabled(){/*cg-sendfile*/if(!${flagfn}("tengu_send_user_file",!0))return!1;`,
+    patchedMarker: '/*cg-sendfile*/if(!',
   },
 
   // ── 上下文窗口限制解除 — 第三方 API 默认 200k → 1M ──
@@ -1421,9 +1556,14 @@ const patches = [
   //   修复：将 M86 默认值从 200000 改为 1000000
   {
     name: 'Raise default context window from 200k to 1M for third-party models',
-    pattern: /var M86=200000/g,
-    replacer: (m) => 'var M86=1000000',
+    // 2.1.142: var M86=200000 ; 2.1.183: var mxt=200000 — mxt is gti()'s default
+    // (the context-window fn, formerly EP). Wildcard the var name; only the
+    // first var of the statement matches (jQ=200000 is comma-prefixed, not var).
+    pattern: /var ([\w$]+)=200000/g,
+    replacer: (m, name) => `var ${name}=1000000/*cg-1m-ctx*/`,
+    patchedMarker: '/*cg-1m-ctx*/',
     sentinel: 'var M86=200000',
+    unique: true,
   },
 
   // ── CLAUDE_CODE_MAX_CONTEXT_TOKENS 环境变量解锁 ──
@@ -1432,9 +1572,9 @@ const patches = [
   // 修复：移除 DISABLE_COMPACT 前置条件，允许用户独立指定上下文大小。
   {
     name: 'Allow CLAUDE_CODE_MAX_CONTEXT_TOKENS without DISABLE_COMPACT',
-    pattern: /if\([\w$]+\(process\.env\.DISABLE_COMPACT\)&&process\.env\.CLAUDE_CODE_MAX_CONTEXT_TOKENS\)\{/g,
-    replacer: (m) => 'if(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS){',
-    sentinel: 'DISABLE_COMPACT)&&process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+    pattern: /if\((?:[\w$]+\(process\.env\.DISABLE_COMPACT\)|[\w$]+\.DISABLE_COMPACT)&&process\.env\.CLAUDE_CODE_MAX_CONTEXT_TOKENS\)\{/g,
+    replacer: (m) => 'if(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS){/*cg-maxctx*/',
+    patchedMarker: 'CLAUDE_CODE_MAX_CONTEXT_TOKENS){/*cg-maxctx*/',
   },
 
   // ── 1h Cache TTL 解锁 — 第三方 API 默认只有 5 分钟缓存 ──
@@ -1453,12 +1593,15 @@ const patches = [
   //   修复：跳过 qq() 和 isUsingOverage 的检查，让 GrowthBook flag 接管。
   {
     name: 'Unlock 1h cache TTL for third-party API (bypass auth gate)',
-    pattern: /if\(!qq\(\)\|\|[\w$]+\.isUsingOverage\)return!1;/g,
+    // 2.1.143: !qq()||bZ.isUsingOverage ; 2.1.183: !Co()||Ix.isUsingOverage — wildcard the fn name.
+    pattern: /if\(![\w$]+\(\)\|\|[\w$]+\.isUsingOverage\)return!1;/g,
     replacer: (m) => '/* patched: bypass auth check for 1h cache */if(!1)return!1;',
-    sentinel: '!qq()||bZ.isUsingOverage)return!1;',
+    patchedMarker: '/* patched: bypass auth check for 1h cache */if(!1)return!1;',
+    sentinel: 'isUsingOverage)return!1;',
     validate: (match, code) => {
-      // Only apply if this appears near tengu_prompt_cache_1h_config
-      const idx = code.indexOf(match[0]);
+      // Only apply if this appears near tengu_prompt_cache_1h_config.
+      // (match is already the matched string m[0]; do NOT index it again.)
+      const idx = code.indexOf(match);
       const nearby = code.substring(Math.max(0, idx - 300), idx + 300);
       return nearby.includes('tengu_prompt_cache_1h_config');
     },
@@ -1476,9 +1619,11 @@ const patches = [
   //   修复：让 FYH() 对第三方模型也返回 true，启用 global scope。
   {
     name: 'Unlock global cache scope for third-party API',
-    pattern: /function ([\w$]+)\(\)\{if\(!([\w$]+)\(\)\)return!1;if\(!([\w$]+)\(\)\)return!1;let H=([\w$]+)\(\);return H==="firstParty"\|\|H==="anthropicAws"\}/g,
-    replacer: (m, fn, rt, xz, dq) => `function ${fn}(){if(!${rt}())return!1;if(!${xz}())return!1;return!0}`,
-    sentinel: 'H==="firstParty"||H==="anthropicAws"}',
+    // 2.1.142: let H=Dq() ; 2.1.183: let e=Ir() — wildcard the temp var (was hardcoded H).
+    pattern: /function ([\w$]+)\(\)\{if\(!([\w$]+)\(\)\)return!1;if\(!([\w$]+)\(\)\)return!1;let [\w$]+=([\w$]+)\(\);return [\w$]+==="firstParty"\|\|[\w$]+==="anthropicAws"\}/g,
+    replacer: (m, fn, rt, xz, dq) => `function ${fn}(){if(!${rt}())return!1;if(!${xz}())return!1;/*cg-global-cache*/return!0}`,
+    patchedMarker: '/*cg-global-cache*/return!0',
+    unique: true,
   },
 // ── Auto Mode (AFK Detection) 解锁 ──
   // $i() 是 auto-mode 启用检查：
@@ -1530,6 +1675,7 @@ const patches = [
     pattern: /function [\w$]+\(\)\{if\([\w$]+\(\)!=="firstParty"\)return;/g,
     replacer: (m) => m.replace(/if\([\w$]+\(\)!=="firstParty"\)return;/, ''),
     sentinel: '"claude-opus-4"',  // sentinel for opus migration context
+    optional: true,  // removed in v2.1.160+
     validate: (match, code) => {
       const pos = code.indexOf(match);
       const nearby = code.substring(pos, pos + 500);
@@ -1541,11 +1687,50 @@ const patches = [
     pattern: /function [\w$]+\(\)\{if\([\w$]+\(\)!=="firstParty"\)return;/g,
     replacer: (m) => m.replace(/if\([\w$]+\(\)!=="firstParty"\)return;/, ''),
     sentinel: '"claude-sonnet-4-5"',  // sentinel for sonnet migration context
+    optional: true,  // removed in v2.1.160+
     validate: (match, code) => {
       const pos = code.indexOf(match);
       const nearby = code.substring(pos, pos + 500);
       return nearby.includes('claude-sonnet-4-5');
     },
+  },
+  {
+    // k9() is the system prompt identity function.
+    // Original: function k9(H){return H}
+    // Patched:  function k9(H){let _=process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(_)H.push(_);return H}
+    // Appends CLAUDE.md (injected via cli.cjs) into the system prompt array
+    // so third-party API models see CLAUDE.md as authoritative system instruction,
+    // not as auxiliary userContext.
+    name: 'Append CLAUDE_CODE_APPEND_SYSTEM_PROMPT into system prompt (HAi)',
+    // 2.1.142: function k9(H){return H} ; 2.1.183: function HAi(e){let t=e.cli.systemPrompt,n=e.cli.appendSystemPrompt,r=ers();...}
+    // — retarget HAi: merge env CLAUDE_CODE_APPEND_SYSTEM_PROMPT into appendSystemPrompt (new CLI no longer reads this env).
+    pattern: /function ([\w$]+)\(([\w$]+)\)\{let ([\w$]+)=\2\.cli\.systemPrompt,([\w$]+)=\2\.cli\.appendSystemPrompt,([\w$]+)=([\w$]+)\(\);if\(/g,
+    replacer: (m, fn, arg, sys, app, rvar, ersfn) => m.replace(`${ersfn}();if(`, `${ersfn}();/*cg-claudemd*/if(process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT)${app}=${app}?${app}+process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT:process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT;if(`),
+    patchedMarker: '/*cg-claudemd*/if(process.env.CLAUDE_CODE_APPEND_SYSTEM_PROMPT)',
+  },
+  {
+    // finding-06: third-party gateways 400/hang on thinking:{type:"adaptive"} (issue #68551).
+    // vse() defaults true → adaptive thinking sent to custom ANTHROPIC_BASE_URL models.
+    // Guard: 3P base URL → return false (no adaptive). MAX_THINKING_TOKENS (checked
+    // first) and alwaysThinkingEnabled===false (checked before guard) stay in control,
+    // so users who want thinking on a 3P model can still opt in via MAX_THINKING_TOKENS.
+    name: 'Disable adaptive thinking for third-party API (prevent gateway 400/hang)',
+    pattern: /function ([\w$]+)\(\)\{if\(process\.env\.MAX_THINKING_TOKENS\)return parseInt\(process\.env\.MAX_THINKING_TOKENS,10\)>0;let\{settings:[\w$]+\}=[\w$]+\(\);if\([\w$]+\.alwaysThinkingEnabled===!1\)return!1;return!0\}/g,
+    replacer: (m, fn) => m.replace('return!0}', '/*cg-adaptthink*/if(process.env.ANTHROPIC_BASE_URL&&!/anthropic\\.com/i.test(process.env.ANTHROPIC_BASE_URL))return!1;return!0}'),
+    patchedMarker: '/*cg-adaptthink*/',
+  },
+  {
+    // EXECPATH for grep/find shell functions: Claude Code's getEnvironmentOverrides
+    // unconditionally sets c[CLAUDE_CODE_EXECPATH]=process.execPath (=bun under
+    // clawgod) when spawning the Bash subshell. The built-in grep/find functions
+    // exec that path as a bundled ugrep/bfs → bun rejects "-G", all grep dies.
+    // Prefer the env we already set (native binary) in cli.cjs; fall back to
+    // process.execPath only if unset.
+    name: 'EXECPATH: prefer native binary over bun for grep/find shell functions',
+    pattern: /if\(([\w$]+)\[([\w$]+)\]=process\.execPath,/g,
+    replacer: (m, obj, key) => `if(${obj}[${key}]=process.env.CLAUDE_CODE_EXECPATH||process.execPath,`,
+    patchedMarker: '=process.env.CLAUDE_CODE_EXECPATH||process.execPath,',
+    sentinel: '[OYr]=process.execPath,',
   },
 ];
 
@@ -1611,9 +1796,40 @@ for (const p of patches) {
       skipped++;
       continue;
     }
-    // If the patch declares a sentinel (a string that must NOT exist in a
-    // fully-patched file), use it to tell "already applied" apart from
-    // "regex is stale and silently missed the target".
+    // patchedMarker: a string the replacer injects on apply. Its presence is
+    // proof the patch was applied; absence means not-applied (regex stale,
+    // or upstream renamed/removed the target). Checked BEFORE the legacy
+    // sentinel so a minified-name rename (old fragment gone) can no longer
+    // masquerade as "already applied" — the root cause of the 2.1.183
+    // false-greens.
+    if (p.patchedMarker !== undefined) {
+      const markers = Array.isArray(p.patchedMarker) ? p.patchedMarker : [p.patchedMarker];
+      const markersPresent = markers.filter((s) => code.includes(s));
+      if (markersPresent.length === markers.length) {
+        console.log(`  ✅ ${p.name} (already applied, marker present)`);
+        applied++;
+        continue;
+      }
+      // marker absent → not applied. sentinel (old unpatched fragment)
+      // distinguishes stale (target still present, regex missed it) from
+      // upstream-changed (target renamed/removed entirely).
+      if (p.sentinel !== undefined) {
+        const sentinels = Array.isArray(p.sentinel) ? p.sentinel : [p.sentinel];
+        const stillPresent = sentinels.filter((s) => code.includes(s));
+        if (stillPresent.length > 0) {
+          console.log(`  ❌ ${p.name} — regex stale, sentinel still in source: ${stillPresent.map((s) => JSON.stringify(s)).join(', ')}`);
+          failed++;
+        } else {
+          console.log(`  ⚠️  ${p.name} (0 matches, marker+sentinel absent — upstream renamed/removed)`);
+          skipped++;
+        }
+      } else {
+        console.log(`  ⚠️  ${p.name} (0 matches, marker absent — cannot verify)`);
+        skipped++;
+      }
+      continue;
+    }
+    // Legacy sentinel behavior (patches without a patchedMarker).
     if (p.sentinel !== undefined) {
       const sentinels = Array.isArray(p.sentinel) ? p.sentinel : [p.sentinel];
       const stillPresent = sentinels.filter((s) => code.includes(s));
@@ -1639,6 +1855,18 @@ for (const p of patches) {
     console.log(`  ⚠️  ${p.name} (0 matches, no sentinel — cannot verify)`);
     skipped++;
     continue;
+  }
+
+  // Safety net: even if the pattern still matches a prefix (e.g. the
+  // `claude update` redirect), a present patchedMarker means the patch was
+  // applied before — skip to avoid double-injecting on re-runs.
+  if (p.patchedMarker !== undefined) {
+    const markers = Array.isArray(p.patchedMarker) ? p.patchedMarker : [p.patchedMarker];
+    if (markers.every((s) => code.includes(s))) {
+      console.log(`  ✅ ${p.name} (already applied, marker present)`);
+      applied++;
+      continue;
+    }
   }
 
   if (verify) {
@@ -1699,14 +1927,22 @@ $featuresFile = Join-Path $ClawDir "features.json"
 if (-not (Test-Path $featuresFile)) {
     $featuresJson = @'
 {
-  "tengu_harbor": true,
-  "tengu_session_memory": true,
+  "tengu_harbor": false,
+  "tengu_session_memory": false,
   "tengu_amber_flint": true,
-  "tengu_auto_background_agents": true,
+  "tengu_auto_background_agents": false,
   "tengu_destructive_command_warning": true,
   "tengu_immediate_model_command": true,
   "tengu_desktop_upsell": false,
-  "tengu_prompt_cache_1h_config": {"allowlist": ["*"]}
+  "tengu_malort_pedway": {"enabled": true},
+  "tengu_amber_quartz_disabled": false,
+  "tengu_prompt_cache_1h_config": {"allowlist": ["*"]},
+  "tengu_moth_copse": true,
+  "tengu_sepia_moth": true,
+  "tengu_umber_petrel": true,
+  "tengu_sepia_cormorant": ["claude", "deepseek", "qwen", "gpt", "gemini", "o1", "o3", "o4"],
+  "tengu_sedge_lantern": true,
+  "tengu_billiard_aviary": false
 }
 '@
     [System.IO.File]::WriteAllText($featuresFile, $featuresJson, [System.Text.UTF8Encoding]::new($false))
@@ -1883,6 +2119,10 @@ Write-Dim "  Updates: 'claude update' is patched to route through this installer
 Write-Dim "  Just run it as usual — pulls latest Anthropic release + re-patches"
 Write-Dim "  in one step. To leave clawgod and use vanilla update:"
 Write-Dim "    bash ~/.clawgod/install.sh --uninstall"
+Write-Host ""
+Write-Dim "  Version support: ClawGod targets the LATEST Claude Code. Older Claude Code"
+Write-Dim "  versions may still work (patches match stable features, not version-specific"
+Write-Dim "  names), but are not guaranteed. If you hit issues, upgrade Claude Code first."
 Write-Host ""
 Write-Err "  If 'claude' still runs the old version, restart your terminal."
 Write-Host ""
