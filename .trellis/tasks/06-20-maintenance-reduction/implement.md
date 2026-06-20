@@ -17,10 +17,16 @@
 - [x] 删 CHANGELOG.md、src/wiki/;src/.source-version 移出 git + .gitignore。
 - [x] 顺手恢复 bypass.png(会话开始前被工作区删,README 要用,web/public 是软链指向它)。
 
-### Step 4 — R3+R4 README 重写 ⏸ 留给用户下次(对外文案需过目)
-- [ ] 重写 README.md/ZH/JP:版本支持措辞(targets latest/best-effort)、机制说明、删过时 patch 计数。
-- commit: `docs: rewrite READMEs for 2.1.183 + version-support posture`
-- 措辞参照 .trellis/spec/version-support.md。
+### Step 4 — R3+R4 README 重写 ✅ done (c56a090)
+- [x] 决定:只要 ZH 一份 README.md(不要 EN/JP),定位为 AI 维护者先读的项目导览。
+- [x] 重写 README.md:顶部"AI 维护者必读 → AGENTS.md + spec"指针、人类快速开始、机制说明、版本支持姿态;删过时 patch 计数(23/24+)。
+- [x] 删 README_ZH.md / README_JP.md(ZH README 已是 canonical,仅任务文档引用过,web 用绝对 URL 不受影响)。
+
+## 完成标志 ✅
+- 6 个 Step 全部完成(Step 2 按决定取消,保留 optional 分支自废弃)。
+- 每个 Step 独立 commit,工作区干净。
+- 新会话进项目:AGENTS.md + spec 自动指引 patch 维护;README 是项目导览。
+- 唯一未落地:grep 修复需用户重启 clawgod 生效(当前会话 env 已定)。
 
 ### Step 5 — R4 install 版本姿态告知 ✅ done (038b9b1)
 - [x] install.sh/install.ps1 末尾加 "targets LATEST, older best-effort" 告知(替代复杂版本检测,best-effort 姿态下不该阻断)。
