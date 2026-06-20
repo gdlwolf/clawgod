@@ -1681,6 +1681,19 @@ const patches = [
     replacer: (m, fn) => m.replace('return!0}', '/*cg-adaptthink*/if(process.env.ANTHROPIC_BASE_URL&&!/anthropic\\.com/i.test(process.env.ANTHROPIC_BASE_URL))return!1;return!0}'),
     patchedMarker: '/*cg-adaptthink*/',
   },
+  {
+    // EXECPATH for grep/find shell functions: Claude Code's getEnvironmentOverrides
+    // unconditionally sets c[CLAUDE_CODE_EXECPATH]=process.execPath (=bun under
+    // clawgod) when spawning the Bash subshell. The built-in grep/find functions
+    // exec that path as a bundled ugrep/bfs → bun rejects "-G", all grep dies.
+    // Prefer the env we already set (native binary) in cli.cjs; fall back to
+    // process.execPath only if unset.
+    name: 'EXECPATH: prefer native binary over bun for grep/find shell functions',
+    pattern: /if\(([\w$]+)\[([\w$]+)\]=process\.execPath,/g,
+    replacer: (m, obj, key) => `if(${obj}[${key}]=process.env.CLAUDE_CODE_EXECPATH||process.execPath,`,
+    patchedMarker: '=process.env.CLAUDE_CODE_EXECPATH||process.execPath,',
+    sentinel: '[OYr]=process.execPath,',
+  },
 ];
 
 // ─── Main ─────────────────────────────────────────────────
