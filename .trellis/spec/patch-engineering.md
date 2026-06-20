@@ -5,7 +5,7 @@
 
 ## 1. 版本定位
 
-clawgod **targets the latest Claude Code**(见 version-support.md)。不为旧版本专门写兼容分支。但补丁写作方式(见下)天然让上游改名时大概率自适应——这是"降本手段",不是"兼容包袱"。
+clawgod **targets the latest Claude Code**(见 version-support.md)。不为旧版本**新增**兼容分支。但已存在的 `optional: true` 旧分支保留——它们在新版本里 0 匹配会自动 skip(不打扰、不出错、不需维护),删除的判断成本和风险反而更高。通配补丁写作方式(见下)让上游改名时大概率自适应——这是"降本手段",不是"兼容包袱"。
 
 ## 2. 禁止硬编码 minified 标识符(最高优先级)
 

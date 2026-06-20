@@ -8,13 +8,10 @@
 - [x] 实测 native binary 能当 ugrep(模拟 grep 函数调用)。
 - 注:实际生效需用户下次启动 clawgod(新进程读新 env);当前会话 grep 仍旧 env 是预期。
 
-### Step 2 — R1 删历史 optional 分支 ⏸ 留给用户下次(风险最高,需逐条判断)
-- [ ] 读 patch.mjs,逐条评估 `optional: true` 条目(design D1 判据)。
-- [ ] 删确定的历史分支;同步三处。
-- [ ] 干净 repatch 2.1.183 + dry-run:0 failed、0 false-green、marker 全 present。
-- commit: `chore(patch): drop legacy version-compat optional branches`
-- 候选删除(注释含 "removed in vNx+" 或 "auto-bypass"):Computer Use subscription bypass、Computer Use gate bypass、Voice Mode enable、cI6/dI6 DISABLE_EXPERIMENTAL_BETAS、NI6 DISABLE_EXPERIMENTAL_BETAS、legacy Opus/Sonnet migration。
-- 候选保留(仍有用,非纯兼容):Sub-agent model inherit、Remove "Not logged in" notice、Attachment filter bypass、Message list filter bypass。
+### Step 2 — R1 删历史 optional 分支 ❌ 取消(决定保留)
+- **决定:不删**。`optional: true` 旧分支在新版本里 0 匹配会自动 skip(dry-run 显示 `not present in this version`),不打扰、不出错、不需维护。删它们的判断成本和风险(可能误删仍有效的)远高于保留成本。
+- 这与"targets latest,不为旧版写新分支"策略一致:不为旧版**新增**投入,但已存在的旧分支让它**自废弃**,不主动删除。
+- 未来若某条 optional 分支确认 100% 无用且碍事,再单独评估删除,不做批量清理。
 
 ### Step 3 — R3 清理无用文件 ✅ done (c6d6756)
 - [x] 删 CHANGELOG.md、src/wiki/;src/.source-version 移出 git + .gitignore。
